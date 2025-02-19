@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use anyhow::Result;
+use ignore::overrides::OverrideBuilder;
+use ignore::WalkBuilder;
 use log::{debug, error, info};
-use walkdir::WalkDir;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
@@ -117,10 +118,19 @@ fn generate_command(args: &GenerateArgs) -> Result<()>{
 
     // push all files to job queue
     let mut file_cnt = 0_usize;
-    let walker = WalkDir::new(&generate_context.base_dir).into_iter();
+    // TODO: use a separate file to store all overrides
+    let macos_override = OverrideBuilder::new(&generate_context.base_dir)
+        .add("!._*")?
+        .add("!.DS_Store")?
+        .build()?;
+    let walker = WalkBuilder::new(&generate_context.base_dir)
+        .hidden(false)
+        .skip_stdout(true)
+        .overrides(macos_override)
+        .build();
     for entry in walker{
         let entry = entry?;
-        if entry.file_type().is_file(){
+        if entry.file_type().is_some_and(|x| x.is_file()){
             generate_context.job_queue.lock().unwrap().push_front(entry.into_path());
             generate_context.condvar.notify_all();
             file_cnt += 1;

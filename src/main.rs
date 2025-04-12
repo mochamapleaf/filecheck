@@ -227,7 +227,8 @@ fn subset_command(args: &SubsetArgs) -> Result<()>{
     //println!("{:?}", dest_hashmap);
 
 
-    let mut diff_result = Vec::<PathBuf>::new();
+    let mut missing_checksum_result = Vec::<PathBuf>::new();
+    let mut missing_duplicate_result = Vec::<PathBuf>::new();
 
     for (hash, mut paths) in src_hashmap.into_iter(){
         if let Some(dest_paths) = dest_hashmap.remove(&hash){
@@ -235,24 +236,29 @@ fn subset_command(args: &SubsetArgs) -> Result<()>{
             // check if dest_paths contains paths
             if paths.len() == 1 && dest_paths.len() == 1 { 
                 if paths[0] != dest_paths[0]{
-                    diff_result.push(paths.pop().unwrap());
+                    missing_duplicate_result.push(paths.pop().unwrap());
                 }
             }else{
                 // use hashset to check
                 let src_set: HashSet<_> = paths.into_iter().collect();
                 let dest_set: HashSet<_> = dest_paths.into_iter().collect();
                 for path in src_set.difference(&dest_set){
-                    diff_result.push(path.clone());
+                    missing_duplicate_result.push(path.clone());
                 }
             }
         } else { 
             // dest does not contain src
-            diff_result.append(&mut paths);
+            missing_checksum_result.append(&mut paths);
         }
     }
-    for path in diff_result.iter(){
+    println!("Missing checksum: ");
+    for path in missing_checksum_result.iter(){
         println!("{:?}", path);
     }
-    println!("Total difference: {}", diff_result.len());
+    println!("Missing duplicate: ");
+    for path in missing_duplicate_result.iter(){
+        println!("{:?}", path);
+    }
+    println!("Total missing checksum: {}, Total missing duplicate: {}", missing_checksum_result.len(), missing_duplicate_result.len());
     return Ok(());
 }

@@ -1,26 +1,18 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use anyhow::Result;
-use ignore::overrides::OverrideBuilder;
-use ignore::WalkBuilder;
-use log::{debug, error, info};
+use filecheck::{GenerateOptions, HashType};
 
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
-use std::sync::{atomic, Arc, Condvar, Mutex};
-use std::thread;
-use std::io;
+use std::path::Path;
+use std::process::ExitCode;
 
-//takes argument
-// file_checker -g src -j $(nproc) -o output
-// -g, generate checksum for directory, output a custom serialized file
-// -o, specify output file
-// file_checker -c src_file dest_file
-// -c, contains, check if destination contains the src, must pass in files, not directory
-// remember to use -g to generate before using -c
-// -j, job count, specify how many threads used for generation
-// -t, checksum type, [md5] or [sha256], md5 is default
-// -h, output would be in human readble list
+// filecheck generate src -j $(nproc) -o output
+//   generate checksums for every file under src (hidden and gitignored files included)
+// filecheck subset src.dump dest.dump
+//   check every file of src exists in dest with the same content and relative path
+// filecheck export dump
+//   print a dump in sha256sum/md5sum format, sorted by path
+// exit code is 1 when a file could not be read, or when subset finds missing files
 
 #[derive(Parser, Debug)]
 #[command(name="filecheck")]
@@ -37,6 +29,9 @@ enum Commands{
 
     /// Check if destination contains the source (source /subseteq destination)
     Subset (SubsetArgs),
+
+    /// Print a dump as "<checksum>  ./<path>" lines, sorted by path
+    Export (ExportArgs),
 }
 
 #[derive(Debug, Parser, Clone)]
@@ -45,20 +40,23 @@ struct GenerateArgs {
     #[arg(required=true)]
     src: OsString,
     /// number of jobs to run concurrently
-    #[arg(short, long, default_value_t=get_nproc())]
+    #[arg(short, long, default_value_t=GenerateOptions::default().jobs)]
     jobs: usize,
     /// path to output file
     #[arg(short, long, default_value_os="filecheck.dump")]
     output: OsString,
     /// checksum type used
-    #[arg(short='t', long="hashtype", default_value_os="md5")]
+    #[arg(short='t', long="hashtype", value_enum, default_value_t=HashType::SHA256)]
     hashtype: HashType,
-}
-
-#[derive(ValueEnum, Copy, Clone, Debug, PartialEq, Eq)]
-enum HashType{
-    MD5,
-    SHA256,
+    /// also checksum macOS metadata files (._* and .DS_Store)
+    #[arg(long)]
+    include_macos_metadata: bool,
+    /// bytes read per call, e.g. 8K or 1M; larger is faster on network shares and WSL /mnt drives
+    #[arg(short='b', long, default_value="1M", value_parser=filecheck::parse_size)]
+    buffer_size: usize,
+    /// overwrite the output file if it exists
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -71,194 +69,70 @@ struct SubsetArgs{
     dest: OsString,
 }
 
-// get number of threads available
-fn get_nproc() -> usize{ thread::available_parallelism().map(|x| x.get()).unwrap_or(1) }
-fn main() -> Result<()>{
-    let args = Cli::parse();
-    //setup log level
-    env_logger::init();
+#[derive(Debug, Parser)]
+struct ExportArgs{
+    /// dump file
+    #[arg(required=true)]
+    dump: OsString,
+}
 
-    #[allow(unreachable_patterns)]
+fn main() -> Result<ExitCode>{
+    let args = Cli::parse();
+    //setup log level, info by default
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     match args.command{
         Commands::Generate(args) => generate_command(&args),
         Commands::Subset(args) => subset_command(&args),
-        _ => todo!(),
+        Commands::Export(args) => export_command(&args),
     }
 }
 
-fn generate_command(args: &GenerateArgs) -> Result<()>{
-    // uses a job queue, used to generate checksum for each file
-    // not using mpsc for simplicity
+fn generate_command(args: &GenerateArgs) -> Result<ExitCode>{
+    let opts = GenerateOptions{
+        jobs: args.jobs,
+        hashtype: args.hashtype,
+        include_macos_metadata: args.include_macos_metadata,
+        buffer_size: args.buffer_size,
+    };
+    let generated = filecheck::generate(Path::new(&args.src), &opts)?;
+    filecheck::write_dump(&generated.dump, Path::new(&args.output), args.force)?;
+    println!("Output written to {:?}", args.output);
+    println!("Files: {}, failed: {}, skipped non-regular: {}",
+        generated.file_count, generated.failures.len(), generated.skipped_count);
 
-    let generate_context = Arc::new(GenerateContext{
-        base_dir: PathBuf::from(&args.src).canonicalize()?,
-        job_queue: Mutex::new(VecDeque::new()),
-        condvar: Condvar::new(),
-        finished: atomic::AtomicBool::new(false),
-        hash_map: Mutex::new(HashMap::new()),
-        args: args.clone(),
-    });
-    info!("Generating checksum for files in {:?}", generate_context.base_dir);
-    // let job_queue = Arc::new(Mutex::new(VecDeque::new()));
-    // let condvar = Arc::new(Condvar::new());
-    // let hash_map = Arc::new(Mutex::new(HashMap::new()));
-    // let args = Arc::new(args.clone());
-
-    // create a thread pool with the number of jobs
-    let mut threads = Vec::new();
-    for _ in 0..args.jobs{
-        // let job_queue = job_queue.clone();
-        // let condvar = condvar.clone();
-        // let hash_map = hash_map.clone();
-        // let args: Arc<GenerateArgs> = args.to_owned();
-        let context = generate_context.clone();
-        threads.push(thread::spawn(move || worker(context)));
-    }
-
-
-    // push all files to job queue
-    let mut file_cnt = 0_usize;
-    // TODO: use a separate file to store all overrides
-    let macos_override = OverrideBuilder::new(&generate_context.base_dir)
-        .add("!._*")?
-        .add("!.DS_Store")?
-        .build()?;
-    let walker = WalkBuilder::new(&generate_context.base_dir)
-        .hidden(false)
-        .skip_stdout(true)
-        .overrides(macos_override)
-        .build();
-    for entry in walker{
-        let entry = entry?;
-        if entry.file_type().is_some_and(|x| x.is_file()){
-            generate_context.job_queue.lock().unwrap().push_front(entry.into_path());
-            generate_context.condvar.notify_all();
-            file_cnt += 1;
+    // the dump is still written, but an incomplete dump must not look like success
+    if !generated.failures.is_empty(){
+        eprintln!("Failed to checksum {} entries:", generated.failures.len());
+        for (path, reason) in generated.failures.iter(){
+            eprintln!("{}: {}", path, reason);
         }
+        return Ok(ExitCode::FAILURE);
     }
-
-    while !generate_context.job_queue.lock().unwrap().is_empty(){
-        // wait for all jobs to finish
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
-    generate_context.finished.store(true, atomic::Ordering::Relaxed);
-    for thread in threads{
-        generate_context.condvar.notify_all();
-        thread.join().unwrap()?;
-    }
-
-    //dump into output file
-    bincode::serialize_into(std::fs::File::create(&args.output)?, &*generate_context.hash_map.lock().unwrap())?;
-
-    info!("Generated checksum for {} files", file_cnt);
-    info!("Output written to {:?}", generate_context.args.output);
-    info!("Hashset size: {}", generate_context.hash_map.lock().unwrap().len());
-    return Ok(());
-    
+    Ok(ExitCode::SUCCESS)
 }
 
-struct GenerateContext{
-    base_dir: PathBuf,
-    job_queue: Mutex<VecDeque<PathBuf>>,
-    condvar: Condvar,
-    finished: atomic::AtomicBool,
-    hash_map: Mutex<HashMap<Vec<u8>, Vec<PathBuf>>>,
-    args: GenerateArgs,
-}
+fn subset_command(args: &SubsetArgs) -> Result<ExitCode>{
+    let src = filecheck::read_dump(Path::new(&args.src))?;
+    let dest = filecheck::read_dump(Path::new(&args.dest))?;
+    let report = filecheck::subset(&src, &dest)?;
 
-fn worker(context: Arc<GenerateContext>) -> Result<()>{
-    let GenerateContext{base_dir, job_queue, condvar, finished, hash_map, args} = context.as_ref();
-    loop{
-        let path = {
-            let mut job_queue = job_queue.lock().unwrap();
-            while job_queue.is_empty(){
-                if finished.load(atomic::Ordering::Relaxed){
-                    info!("Thread {:?} finished", std::thread::current().id());
-                    return Ok(());
-                }
-                job_queue = condvar.wait(job_queue).unwrap();
-                debug!("Thread {:?} woke up", std::thread::current().id());
-            }
-            job_queue.pop_back().unwrap()
-        };
-        debug!("Thread {:?} processing {:?}", std::thread::current().id(), path);
-        match compute_checksum(path.as_path(), args.hashtype){
-            Ok(checksum) => {
-                let mut hash_map = hash_map.lock().unwrap();
-                // all paths comes from the base directory, this should not fail
-                //println!("Processed: {:?}", path);
-                let rel_path = path.strip_prefix(&base_dir)?;
-                // Seems PathBuf is not capable of stripping itself in place
-                hash_map.entry(checksum).or_insert(Vec::new()).push(rel_path.to_path_buf());
-            },
-            Err(e) => {
-                error!("Error: Failed to compute checksum for file: {:?}\n{:?}", path, e);
-            }
-        }
-    }
-    
-}
-
-
-fn compute_checksum(path: &Path, hashtype: HashType) -> Result<Vec<u8>>{
-    
-    let mut file = std::io::BufReader::new(std::fs::File::open(path)?);
-    
-    match hashtype{
-        HashType::MD5 => {
-            use md5::{Digest, Md5};
-            let mut hasher = Md5::new();
-            io::copy(&mut file, &mut hasher)?;
-            Ok(hasher.finalize().to_vec())
-        },
-        HashType::SHA256 => {
-            todo!();
-        }
-    }
-}
-
-fn subset_command(args: &SubsetArgs) -> Result<()>{
-    // load the hash map from file
-    let src_hashmap: HashMap<Vec<u8>, Vec<PathBuf>> = bincode::deserialize_from(std::fs::File::open(&args.src)?)?;
-    let mut dest_hashmap: HashMap<Vec<u8>, Vec<PathBuf>> = bincode::deserialize_from(std::fs::File::open(&args.dest)?)?;
-
-    //println!("{:?}", src_hashmap);
-    //println!("{:?}", dest_hashmap);
-
-
-    let mut missing_checksum_result = Vec::<PathBuf>::new();
-    let mut missing_duplicate_result = Vec::<PathBuf>::new();
-
-    for (hash, mut paths) in src_hashmap.into_iter(){
-        if let Some(dest_paths) = dest_hashmap.remove(&hash){
-            //println!("Hash: {:?} - src: {:?}, dest: {:?}", hash, paths, dest_paths);
-            // check if dest_paths contains paths
-            if paths.len() == 1 && dest_paths.len() == 1 { 
-                if paths[0] != dest_paths[0]{
-                    missing_duplicate_result.push(paths.pop().unwrap());
-                }
-            }else{
-                // use hashset to check
-                let src_set: HashSet<_> = paths.into_iter().collect();
-                let dest_set: HashSet<_> = dest_paths.into_iter().collect();
-                for path in src_set.difference(&dest_set){
-                    missing_duplicate_result.push(path.clone());
-                }
-            }
-        } else { 
-            // dest does not contain src
-            missing_checksum_result.append(&mut paths);
-        }
-    }
     println!("Missing checksum: ");
-    for path in missing_checksum_result.iter(){
-        println!("{:?}", path);
+    for path in report.missing_checksum.iter(){
+        println!("{}", path);
     }
     println!("Missing duplicate: ");
-    for path in missing_duplicate_result.iter(){
-        println!("{:?}", path);
+    for path in report.missing_duplicate.iter(){
+        println!("{}", path);
     }
-    println!("Total missing checksum: {}, Total missing duplicate: {}", missing_checksum_result.len(), missing_duplicate_result.len());
-    return Ok(());
+    println!("Total missing checksum: {}, Total missing duplicate: {}", report.missing_checksum.len(), report.missing_duplicate.len());
+    Ok(if report.is_subset() { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+}
+
+fn export_command(args: &ExportArgs) -> Result<ExitCode>{
+    let dump = filecheck::read_dump(Path::new(&args.dump))?;
+    for line in filecheck::export_lines(&dump){
+        println!("{}", line);
+    }
+    Ok(ExitCode::SUCCESS)
 }

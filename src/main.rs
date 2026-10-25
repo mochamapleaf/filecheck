@@ -12,7 +12,9 @@ use std::process::ExitCode;
 //   check every file of src exists in dest with the same content and relative path
 // filecheck export dump
 //   print a dump in sha256sum/md5sum format, sorted by path
-// exit code is 1 when a file could not be read, or when subset finds missing files
+// filecheck locate src.dump dest1.dump dest2.dump --exclude _trash [--expect staging.dump --expect-prefix sub]
+//   for every file of src, print "<status>\t<path>\t<where>": is its content anywhere in the destinations?
+// exit code is 1 when a file could not be read, or when subset/locate finds missing files
 
 #[derive(Parser, Debug)]
 #[command(name="filecheck")]
@@ -32,6 +34,9 @@ enum Commands{
 
     /// Print a dump as "<checksum>  ./<path>" lines, sorted by path
     Export (ExportArgs),
+
+    /// For every file in SRC, find whether its content (any path) exists in the DEST dumps
+    Locate (LocateArgs),
 }
 
 #[derive(Debug, Parser, Clone)]
@@ -76,6 +81,25 @@ struct ExportArgs{
     dump: OsString,
 }
 
+#[derive(Debug, Parser)]
+struct LocateArgs{
+    /// dump of the files to look for
+    #[arg(required=true)]
+    src: OsString,
+    /// dumps to search, read one at a time
+    #[arg(required=true, num_args=1..)]
+    dest: Vec<OsString>,
+    /// destination paths containing this text do not count as a copy (repeatable)
+    #[arg(long)]
+    exclude: Vec<String>,
+    /// also require every SRC file to have the same checksum at the same path in this dump
+    #[arg(long)]
+    expect: Option<OsString>,
+    /// directory inside the expect dump that SRC paths are relative to
+    #[arg(long, default_value="", requires="expect")]
+    expect_prefix: String,
+}
+
 fn main() -> Result<ExitCode>{
     let args = Cli::parse();
     //setup log level, info by default
@@ -85,7 +109,34 @@ fn main() -> Result<ExitCode>{
         Commands::Generate(args) => generate_command(&args),
         Commands::Subset(args) => subset_command(&args),
         Commands::Export(args) => export_command(&args),
+        Commands::Locate(args) => locate_command(&args),
     }
+}
+
+fn locate_command(args: &LocateArgs) -> Result<ExitCode>{
+    let src = filecheck::read_dump(Path::new(&args.src))?;
+    let mut locator = filecheck::Locator::new(&src);
+    for dest in args.dest.iter(){
+        // read and drop each destination in turn to bound memory
+        let dump = filecheck::read_dump(Path::new(dest))?;
+        let label = Path::new(dest).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        locator.add_dest(&label, &dump, &args.exclude)?;
+    }
+    let expect = match &args.expect{
+        Some(path) => Some(filecheck::read_dump(Path::new(path))?),
+        None => None,
+    };
+    let entries = locator.finish(expect.as_ref().map(|d| (d, args.expect_prefix.as_str())))?;
+
+    let mut counts = std::collections::BTreeMap::new();
+    for entry in entries.iter(){
+        *counts.entry(entry.status.name()).or_insert(0_usize) += 1;
+        println!("{}\t{}\t{}", entry.status.name(), entry.path, entry.location.as_deref().unwrap_or(""));
+    }
+    let summary: Vec<String> = counts.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+    eprintln!("Total {}: {}", entries.len(), summary.join(" "));
+    let all_found = entries.iter().all(|e| e.status == filecheck::LocateStatus::Found);
+    Ok(if all_found { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
 fn generate_command(args: &GenerateArgs) -> Result<ExitCode>{

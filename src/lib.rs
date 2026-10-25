@@ -353,6 +353,114 @@ pub fn subset(src: &Dump, dest: &Dump) -> Result<SubsetReport>{
     Ok(report)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocateStatus{
+    /// content found in a destination, outside excluded paths
+    Found,
+    /// content found only under excluded destination paths
+    ExcludedOnly,
+    /// content not found in any destination
+    Missing,
+    /// the expect dump has this path with a different checksum
+    Changed,
+    /// the expect dump does not have this path
+    NotExpected,
+}
+
+impl LocateStatus{
+    pub fn name(self) -> &'static str{
+        match self{
+            LocateStatus::Found => "found",
+            LocateStatus::ExcludedOnly => "excluded-only",
+            LocateStatus::Missing => "missing",
+            LocateStatus::Changed => "changed",
+            LocateStatus::NotExpected => "not-expected",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct LocateEntry{
+    pub path: String,
+    pub status: LocateStatus,
+    /// "<destination label>:<path>" of the first match outside excluded paths
+    pub location: Option<String>,
+}
+
+/// Finds where the content of every file in `src` exists among destination dumps, by checksum only
+/// (any path). Destinations are added one at a time so only one large dump is in memory at once,
+/// and only checksums that occur in `src` are kept.
+pub struct Locator<'a>{
+    src: &'a Dump,
+    // checksum -> first location outside excluded paths (None: seen only under excluded paths)
+    hits: HashMap<&'a [u8], Option<String>>,
+}
+
+impl<'a> Locator<'a>{
+    pub fn new(src: &'a Dump) -> Self{
+        Locator{ src, hits: HashMap::new() }
+    }
+
+    /// `exclude`: destination paths containing any of these strings do not count as a copy
+    pub fn add_dest(&mut self, label: &str, dest: &Dump, exclude: &[String]) -> Result<()>{
+        if self.src.hashtype != dest.hashtype{
+            bail!("cannot compare a {} dump with a {} dump ({})", self.src.hashtype.name(), dest.hashtype.name(), label);
+        }
+        let src: &'a Dump = self.src;
+        for hash in src.files.keys(){
+            if let Some(Some(_)) = self.hits.get(hash.as_slice()){
+                continue;
+            }
+            let Some(dest_paths) = dest.files.get(hash) else { continue };
+            let kept = dest_paths.iter().find(|p| !exclude.iter().any(|x| p.contains(x.as_str())));
+            self.hits.insert(hash.as_slice(), kept.map(|p| format!("{}:{}", label, p)));
+        }
+        Ok(())
+    }
+
+    /// One entry per src file, sorted by path. With `expect` (dump, prefix), a file also has to be
+    /// in that dump at `<prefix>/<path>` with the same checksum, otherwise it is Changed or NotExpected.
+    pub fn finish(self, expect: Option<(&Dump, &str)>) -> Result<Vec<LocateEntry>>{
+        let expected: Option<HashMap<&str, &[u8]>> = match expect{
+            Some((dump, _)) => {
+                if dump.hashtype != self.src.hashtype{
+                    bail!("cannot compare a {} dump with a {} expect dump", self.src.hashtype.name(), dump.hashtype.name());
+                }
+                Some(dump.files.iter()
+                    .flat_map(|(hash, paths)| paths.iter().map(move |p| (p.as_str(), hash.as_slice())))
+                    .collect())
+            },
+            None => None,
+        };
+        let prefix = expect.map(|(_, p)| p.trim_matches('/')).unwrap_or("");
+        let mut entries = Vec::new();
+        for (hash, paths) in self.src.files.iter(){
+            let hit = self.hits.get(hash.as_slice());
+            for path in paths{
+                let mut location = None;
+                let status = match &expected{
+                    Some(map) => {
+                        let key = if prefix.is_empty() { path.clone() } else { format!("{}/{}", prefix, path) };
+                        match map.get(key.as_str()){
+                            None => Some(LocateStatus::NotExpected),
+                            Some(h) if *h != hash.as_slice() => Some(LocateStatus::Changed),
+                            Some(_) => None,
+                        }
+                    },
+                    None => None,
+                }.unwrap_or_else(|| match hit{
+                    Some(Some(loc)) => { location = Some(loc.clone()); LocateStatus::Found },
+                    Some(None) => LocateStatus::ExcludedOnly,
+                    None => LocateStatus::Missing,
+                });
+                entries.push(LocateEntry{ path: path.clone(), status, location });
+            }
+        }
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(entries)
+    }
+}
+
 /// Lines in `sha256sum` / `md5sum` format ("<hex>  ./<path>"), sorted by path in byte order,
 /// so a dump can be compared with `find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum`.
 pub fn export_lines(dump: &Dump) -> Vec<String>{

@@ -94,6 +94,8 @@ pub struct Generated{
     pub skipped_count: usize,
     /// (path, reason) for every entry that could not be read or checksummed
     pub failures: Vec<(String, String)>,
+    /// non-empty files whose content is all zero bytes (often a broken or never-downloaded copy), sorted
+    pub zero_files: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -152,6 +154,7 @@ pub fn generate(base_dir: &Path, opts: &GenerateOptions) -> Result<Generated>{
 
     let queue = Mutex::new(queue);
     let files = Mutex::new(ChecksumMap::new());
+    let zero_files = Mutex::new(Vec::new());
     let failures = Mutex::new(failures);
     let jobs = opts.jobs.max(1);
     let buffer_size = opts.buffer_size.max(1);
@@ -165,7 +168,12 @@ pub fn generate(base_dir: &Path, opts: &GenerateOptions) -> Result<Generated>{
                     let result = relative_path(&base_dir, &path)
                         .and_then(|rel| checksum_with_buffer(&path, opts.hashtype, &mut buffer).map(|sum| (rel, sum)));
                     match result{
-                        Ok((rel, sum)) => files.lock().unwrap().entry(sum).or_default().push(rel),
+                        Ok((rel, (sum, zero))) => {
+                            if zero{
+                                zero_files.lock().unwrap().push(rel.clone());
+                            }
+                            files.lock().unwrap().entry(sum).or_default().push(rel);
+                        },
                         Err(e) => {
                             error!("Failed to checksum {:?}: {:#}", path, e);
                             failures.lock().unwrap().push((path.to_string_lossy().into_owned(), format!("{:#}", e)));
@@ -178,6 +186,8 @@ pub fn generate(base_dir: &Path, opts: &GenerateOptions) -> Result<Generated>{
 
     let files = files.into_inner().unwrap();
     let failures = failures.into_inner().unwrap();
+    let mut zero_files = zero_files.into_inner().unwrap();
+    zero_files.sort();
     let hashed: usize = files.values().map(Vec::len).sum();
     info!("Found {} files, checksummed {}, failed {}, skipped {} non-regular entries",
         file_count, hashed, failures.len(), skipped_count);
@@ -186,6 +196,7 @@ pub fn generate(base_dir: &Path, opts: &GenerateOptions) -> Result<Generated>{
         file_count,
         skipped_count,
         failures,
+        zero_files,
     })
 }
 
@@ -260,11 +271,12 @@ fn push_escaped(out: &mut String, text: &str){
 }
 
 pub fn compute_checksum(path: &Path, hashtype: HashType) -> Result<Vec<u8>>{
-    checksum_with_buffer(path, hashtype, &mut vec![0_u8; DEFAULT_BUFFER_SIZE])
+    checksum_with_buffer(path, hashtype, &mut vec![0_u8; DEFAULT_BUFFER_SIZE]).map(|(sum, _)| sum)
 }
 
-// reads the file in buffer-sized chunks straight into the hasher
-fn checksum_with_buffer(path: &Path, hashtype: HashType, buffer: &mut [u8]) -> Result<Vec<u8>>{
+// reads the file in buffer-sized chunks straight into the hasher;
+// also reports whether a non-empty file holds only zero bytes
+fn checksum_with_buffer(path: &Path, hashtype: HashType, buffer: &mut [u8]) -> Result<(Vec<u8>, bool)>{
     let file = std::fs::File::open(path)?;
     match hashtype{
         HashType::MD5 => hash_reader(file, md5::Md5::default(), buffer),
@@ -272,7 +284,9 @@ fn checksum_with_buffer(path: &Path, hashtype: HashType, buffer: &mut [u8]) -> R
     }
 }
 
-fn hash_reader<R: io::Read, D: sha2::Digest>(mut reader: R, mut hasher: D, buffer: &mut [u8]) -> Result<Vec<u8>>{
+fn hash_reader<R: io::Read, D: sha2::Digest>(mut reader: R, mut hasher: D, buffer: &mut [u8]) -> Result<(Vec<u8>, bool)>{
+    let mut total = 0_u64;
+    let mut all_zero = true;
     loop{
         let n = match reader.read(buffer){
             Ok(0) => break,
@@ -281,8 +295,10 @@ fn hash_reader<R: io::Read, D: sha2::Digest>(mut reader: R, mut hasher: D, buffe
             Err(e) => return Err(e.into()),
         };
         hasher.update(&buffer[..n]);
+        total += n as u64;
+        all_zero = all_zero && buffer[..n].iter().all(|&b| b == 0);
     }
-    Ok(hasher.finalize().to_vec())
+    Ok((hasher.finalize().to_vec(), total > 0 && all_zero))
 }
 
 /// Write a dump; refuses to overwrite an existing file unless `force` is set.

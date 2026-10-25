@@ -200,3 +200,21 @@ fn test_unreadable_file_is_reported() {
     assert_eq!(generated.failures.len(), 1);
     assert!(generated.dump.files.is_empty());
 }
+
+#[test]
+fn test_reports_all_zero_files() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("zeros.bin"), vec![0_u8; 3 * 1024 * 1024 + 7]).unwrap();
+    std::fs::write(dir.path().join("empty.txt"), b"").unwrap();
+    let mut mostly = vec![0_u8; 2 * 1024 * 1024];
+    mostly[1_500_000] = 1; // one non-zero byte in the second buffer
+    std::fs::write(dir.path().join("mostly-zero.bin"), mostly).unwrap();
+    std::fs::write(dir.path().join("text.txt"), b"hello").unwrap();
+
+    let mut o = opts(HashType::SHA256);
+    o.buffer_size = 1024 * 1024;
+    let generated = filecheck::generate(dir.path(), &o).unwrap();
+    // empty files are not "all zero"; one non-zero byte anywhere clears the flag
+    assert_eq!(generated.zero_files, vec!["zeros.bin".to_string()]);
+    assert_eq!(generated.file_count, 4);
+}

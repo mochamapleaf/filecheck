@@ -98,8 +98,17 @@ fn generate_command(args: &GenerateArgs) -> Result<ExitCode>{
     let generated = filecheck::generate(Path::new(&args.src), &opts)?;
     filecheck::write_dump(&generated.dump, Path::new(&args.output), args.force)?;
     println!("Output written to {:?}", args.output);
-    println!("Files: {}, failed: {}, skipped non-regular: {}",
-        generated.file_count, generated.failures.len(), generated.skipped_count);
+    println!("Files: {}, failed: {}, skipped non-regular: {}, all-zero content: {}",
+        generated.file_count, generated.failures.len(), generated.skipped_count, generated.zero_files.len());
+
+    // all-zero files are only a warning: the checksums are still valid, but such copies are usually broken
+    if !generated.zero_files.is_empty(){
+        let mut report = std::path::PathBuf::from(&args.output).into_os_string();
+        report.push(".zero.txt");
+        std::fs::write(&report, generated.zero_files.join("\n") + "\n")?;
+        eprintln!("Warning: {} non-empty files contain only zero bytes, list written to {:?}",
+            generated.zero_files.len(), report);
+    }
 
     // the dump is still written, but an incomplete dump must not look like success
     if !generated.failures.is_empty(){
